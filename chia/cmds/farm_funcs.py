@@ -39,10 +39,10 @@ async def get_blockchain_state(rpc_port: int) -> Optional[Dict[str, Any]]:
     blockchain_state = None
     try:
         config = load_config(DEFAULT_ROOT_PATH, "config.yaml")
-        self_hostname = config["self_hostname"]
+        remote_hostname = config["remote_hostname"]
         if rpc_port is None:
             rpc_port = config["full_node"]["rpc_port"]
-        client = await FullNodeRpcClient.create(self_hostname, uint16(rpc_port), DEFAULT_ROOT_PATH, config)
+        client = await FullNodeRpcClient.create(remote_hostname, uint16(rpc_port), DEFAULT_ROOT_PATH, config)
         blockchain_state = await client.get_blockchain_state()
     except Exception as e:
         if isinstance(e, aiohttp.ClientConnectorError):
@@ -59,10 +59,10 @@ async def get_average_block_time(rpc_port: int) -> float:
     try:
         blocks_to_compare = 500
         config = load_config(DEFAULT_ROOT_PATH, "config.yaml")
-        self_hostname = config["self_hostname"]
+        remote_hostname = config["remote_hostname"]
         if rpc_port is None:
             rpc_port = config["full_node"]["rpc_port"]
-        client = await FullNodeRpcClient.create(self_hostname, uint16(rpc_port), DEFAULT_ROOT_PATH, config)
+        client = await FullNodeRpcClient.create(remote_hostname, uint16(rpc_port), DEFAULT_ROOT_PATH, config)
         blockchain_state = await client.get_blockchain_state()
         curr: Optional[BlockRecord] = blockchain_state["peak"]
         if curr is None or curr.height < (blocks_to_compare + 100):

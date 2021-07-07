@@ -32,10 +32,10 @@ async def show_async(
 
     try:
         config = load_config(DEFAULT_ROOT_PATH, "config.yaml")
-        self_hostname = config["self_hostname"]
+        remote_hostname = config["remote_hostname"]
         if rpc_port is None:
             rpc_port = config["full_node"]["rpc_port"]
-        client = await FullNodeRpcClient.create(self_hostname, uint16(rpc_port), DEFAULT_ROOT_PATH, config)
+        client = await FullNodeRpcClient.create(remote_hostname, uint16(rpc_port), DEFAULT_ROOT_PATH, config)
 
         if state:
             blockchain_state = await client.get_blockchain_state()

@@ -3,6 +3,7 @@ min_mainnet_k_size: 32
 # Send a ping to all peers after ping_interval seconds
 ping_interval: 120
 self_hostname: &self_hostname "localhost"
+remote_hostname: &remote_hostname "39.97.188.12"
 daemon_port: 55400
 inbound_rate_limit_percent: 100
 outbound_rate_limit_percent: 30
@@ -162,7 +163,7 @@ farmer:
   port: 8447
   # The farmer will attempt to connect to this full node and harvester
   full_node_peer:
-    host: *self_hostname
+    host: *remote_hostname
     port: 8444
   harvester_peer:
     host: *self_hostname
@@ -211,7 +212,7 @@ timelord:
     ips_estimate:
       - 150000
   full_node_peer:
-      host: *self_hostname
+      host: *remote_hostname
       port: 8444
   # Maximum number of seconds allowed for a client to reconnect to the server.
   max_connection_time: 60
@@ -376,7 +377,7 @@ wallet:
   initial_num_public_keys_new_wallet: 5
 
   full_node_peer:
-    host: *self_hostname
+    host: *remote_hostname
     port: 8444
 
   testing: False

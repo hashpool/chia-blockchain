@@ -525,9 +525,10 @@ class ChiaServer:
                         except asyncio.CancelledError:
                             pass
                         except Exception as e:
-                            tb = traceback.format_exc()
-                            connection.log.error(f"Exception: {e}, {connection.get_peer_info()}. {tb}")
-                            raise e
+                            #tb = traceback.format_exc()
+                            #connection.log.error(f"Exception: {e}, {connection.get_peer_info()}. {tb}")
+                            #raise e
+                            pass
                         return None
 
                     response: Optional[Message] = await asyncio.wait_for(wrapped_coroutine(), timeout=timeout)
