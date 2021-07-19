@@ -27,7 +27,9 @@ from chia.protocols.pool_protocol import (
 )
 from chia.protocols.protocol_message_types import ProtocolMessageTypes
 from chia.server.outbound_message import NodeType, make_msg
+from chia.server.server import ssl_context_for_root
 from chia.server.ws_connection import WSChiaConnection
+from chia.ssl.create_ssl import get_mozilla_ca_crt
 from chia.types.blockchain_format.proof_of_space import ProofOfSpace
 from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.util.bech32m import decode_puzzle_hash
@@ -50,10 +52,27 @@ log = logging.getLogger(__name__)
 
 UPDATE_POOL_INFO_INTERVAL: int = 3600
 UPDATE_POOL_FARMER_INFO_INTERVAL: int = 300
+UPDATE_HARVESTER_CACHE_INTERVAL: int = 60
 
 """
 HARVESTER PROTOCOL (FARMER <-> HARVESTER)
 """
+
+
+class HarvesterCacheEntry:
+    def __init__(self):
+        self.data: Optional[dict] = None
+        self.last_update: float = 0
+
+    def set_data(self, data):
+        self.data = data
+        self.last_update = time.time()
+
+    def needs_update(self):
+        return time.time() - self.last_update > UPDATE_HARVESTER_CACHE_INTERVAL
+
+    def expired(self):
+        return time.time() - self.last_update > UPDATE_HARVESTER_CACHE_INTERVAL * 10
 
 
 class Farmer:
@@ -131,6 +150,8 @@ class Farmer:
         # Last time we updated pool_state based on the config file
         self.last_config_access_time: uint64 = uint64(0)
 
+        self.harvester_cache: Dict[str, Dict[str, HarvesterCacheEntry]] = {}
+
     async def _start(self):
         self.update_pool_state_task = asyncio.create_task(self._periodically_update_pool_state_task())
         self.cache_clear_task = asyncio.create_task(self._periodically_clear_cache_and_refresh_task())
@@ -176,7 +197,9 @@ class Farmer:
     async def _pool_get_pool_info(self, pool_config: PoolWalletConfig) -> Optional[Dict]:
         try:
             async with aiohttp.ClientSession(trust_env=True) as session:
-                async with session.get(f"{pool_config.pool_url}/pool_info") as resp:
+                async with session.get(
+                    f"{pool_config.pool_url}/pool_info", ssl=ssl_context_for_root(get_mozilla_ca_crt())
+                ) as resp:
                     if resp.ok:
                         response: Dict = json.loads(await resp.text())
                         self.log.info(f"GET /pool_info response: {response}")
@@ -212,7 +235,11 @@ class Farmer:
         }
         try:
             async with aiohttp.ClientSession(trust_env=True) as session:
-                async with session.get(f"{pool_config.pool_url}/farmer", params=get_farmer_params) as resp:
+                async with session.get(
+                    f"{pool_config.pool_url}/farmer",
+                    params=get_farmer_params,
+                    ssl=ssl_context_for_root(get_mozilla_ca_crt()),
+                ) as resp:
                     if resp.ok:
                         response: Dict = json.loads(await resp.text())
                         self.log.info(f"GET /farmer response: {response}")
@@ -251,7 +278,10 @@ class Farmer:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    f"{pool_config.pool_url}/farmer", data=post_farmer_body, headers=headers
+                    f"{pool_config.pool_url}/farmer",
+                    data=post_farmer_body,
+                    headers=headers,
+                    ssl=ssl_context_for_root(get_mozilla_ca_crt()),
                 ) as resp:
                     if resp.ok:
                         response: Dict = json.loads(await resp.text())
@@ -287,7 +317,11 @@ class Farmer:
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.put(f"{pool_config.pool_url}/farmer", data=put_farmer_body) as resp:
+                async with session.put(
+                    f"{pool_config.pool_url}/farmer",
+                    data=put_farmer_body,
+                    ssl=ssl_context_for_root(get_mozilla_ca_crt()),
+                ) as resp:
                     if resp.ok:
                         response: Dict = json.loads(await resp.text())
                         self.log.info(f"PUT /farmer response: {response}")
@@ -359,22 +393,32 @@ class Farmer:
                 if time.time() >= pool_state["next_farmer_update"]:
                     authentication_token_timeout = pool_state["authentication_token_timeout"]
 
-                    async def update_pool_farmer_info() -> Optional[dict]:
+                    async def update_pool_farmer_info() -> Tuple[Optional[GetFarmerResponse], Optional[bool]]:
                         # Run a GET /farmer to see if the farmer is already known by the pool
                         response = await self._pool_get_farmer(
                             pool_config, authentication_token_timeout, authentication_sk
                         )
-                        if response is not None and "error_code" not in response:
-                            farmer_info: GetFarmerResponse = GetFarmerResponse.from_json_dict(response)
-                            pool_state["current_difficulty"] = farmer_info.current_difficulty
-                            pool_state["current_points"] = farmer_info.current_points
-                            pool_state["next_farmer_update"] = time.time() + UPDATE_POOL_FARMER_INFO_INTERVAL
-                        return response
+                        farmer_response: Optional[GetFarmerResponse] = None
+                        farmer_known: Optional[bool] = None
+                        if response is not None:
+                            if "error_code" not in response:
+                                farmer_response = GetFarmerResponse.from_json_dict(response)
+                                if farmer_response is not None:
+                                    pool_state["current_difficulty"] = farmer_response.current_difficulty
+                                    pool_state["current_points"] = farmer_response.current_points
+                                    pool_state["next_farmer_update"] = time.time() + UPDATE_POOL_FARMER_INFO_INTERVAL
+                            else:
+                                farmer_known = response["error_code"] != PoolErrorCode.FARMER_NOT_KNOWN.value
+                                self.log.error(
+                                    "update_pool_farmer_info failed: "
+                                    f"{response['error_code']}, {response['error_message']}"
+                                )
+
+                        return farmer_response, farmer_known
 
                     if authentication_token_timeout is not None:
-                        update_response = await update_pool_farmer_info()
-                        is_error = update_response is not None and "error_code" in update_response
-                        if is_error and update_response["error_code"] == PoolErrorCode.FARMER_NOT_KNOWN.value:
+                        farmer_info, farmer_is_known = await update_pool_farmer_info()
+                        if farmer_info is None and farmer_is_known is not None and not farmer_is_known:
                             # Make the farmer known on the pool with a POST /farmer
                             owner_sk = await find_owner_sk(self.all_root_sks, pool_config.owner_public_key)
                             post_response = await self._pool_post_farmer(
@@ -386,13 +430,39 @@ class Farmer:
                                     f"{post_response['welcome_message']}"
                                 )
                                 # Now we should be able to update the local farmer info
-                                update_response = await update_pool_farmer_info()
-                                if update_response is not None and "error_code" in update_response:
-                                    self.log.error(
-                                        f"Failed to update farmer info after POST /farmer: "
-                                        f"{update_response['error_code']}, "
-                                        f"{update_response['error_message']}"
+                                farmer_info, farmer_is_known = await update_pool_farmer_info()
+                                if farmer_info is None and not farmer_is_known:
+                                    self.log.error("Failed to update farmer info after POST /farmer.")
+
+                        # Update the payout instructions on the pool if required
+                        if (
+                            farmer_info is not None
+                            and pool_config.payout_instructions != farmer_info.payout_instructions
+                        ):
+                            owner_sk = await find_owner_sk(self.all_root_sks, pool_config.owner_public_key)
+                            put_farmer_response_dict = await self._pool_put_farmer(
+                                pool_config, authentication_token_timeout, owner_sk
+                            )
+                            try:
+                                # put_farmer_response: PutFarmerResponse = PutFarmerResponse.from_json_dict(
+                                #     put_farmer_response_dict
+                                # )
+                                # if put_farmer_response.payout_instructions:
+                                #     self.log.info(
+                                #         f"Farmer information successfully updated on the pool {pool_config.pool_url}"
+                                #     )
+                                # TODO: Fix Streamable implementation and recover the above.
+                                if put_farmer_response_dict["payout_instructions"]:
+                                    self.log.info(
+                                        f"Farmer information successfully updated on the pool {pool_config.pool_url}"
                                     )
+                                else:
+                                    raise Exception
+                            except Exception:
+                                self.log.error(
+                                    f"Failed to update farmer information on the pool {pool_config.pool_url}"
+                                )
+
                     else:
                         self.log.warning(
                             f"No pool specific authentication_token_timeout has been set for {p2_singleton_puzzle_hash}"
@@ -458,7 +528,8 @@ class Farmer:
 
                 config["pool"]["pool_list"] = new_list
                 save_config(self._root_path, "config.yaml", config)
-                await self.update_pool_state()
+                # Force a GET /farmer which triggers the PUT /farmer if it detects the changed instructions
+                pool_state_dict["next_farmer_update"] = 0
                 return
 
         self.log.warning(f"Launcher id: {launcher_id} not found")
@@ -490,24 +561,73 @@ class Farmer:
 
         return None
 
-    async def get_plots(self) -> Dict:
-        rpc_response = {}
-        for connection in self.server.get_connections():
-            if connection.connection_type == NodeType.HARVESTER:
-                peer_host = connection.peer_host
-                peer_port = connection.peer_port
-                peer_full = f"{peer_host}:{peer_port}"
-                response = await connection.request_plots(harvester_protocol.RequestPlots(), timeout=5)
-                if response is None:
+    async def update_cached_harvesters(self):
+        # First remove outdated cache entries
+        self.log.debug(f"update_cached_harvesters cache entries: {len(self.harvester_cache)}")
+        remove_hosts = []
+        for host, host_cache in self.harvester_cache.items():
+            remove_peers = []
+            for peer_id, peer_cache in host_cache.items():
+                # If the peer cache is expired it means the harvester didn't respond for too long
+                if peer_cache.expired():
+                    remove_peers.append(peer_id)
+            for key in remove_peers:
+                del host_cache[key]
+            if len(host_cache) == 0:
+                self.log.debug(f"update_cached_harvesters remove host: {host}")
+                remove_hosts.append(host)
+        for key in remove_hosts:
+            del self.harvester_cache[key]
+        # Now query each harvester and update caches
+        for connection in self.server.get_connections(NodeType.HARVESTER):
+            cache_entry = await self.get_cached_harvesters(connection)
+            if cache_entry.needs_update():
+                self.log.debug(f"update_cached_harvesters update harvester: {connection.peer_node_id}")
+                response = await connection.request_plots(
+                    harvester_protocol.RequestPlots(), timeout=UPDATE_HARVESTER_CACHE_INTERVAL
+                )
+                if response is not None:
+                    if isinstance(response, harvester_protocol.RespondPlots):
+                        cache_entry.set_data(response.to_json_dict())
+                        self.log.debug(f"update_cached_harvesters cache updated: {connection.peer_node_id}")
+                    else:
+                        self.log.error(
+                            f"Invalid response from harvester:"
+                            f"peer_host {connection.peer_host}, peer_node_id {connection.peer_node_id}"
+                        )
+                else:
                     self.log.error(
                         "Harvester did not respond. You might need to update harvester to the latest version"
                     )
-                    continue
-                if not isinstance(response, harvester_protocol.RespondPlots):
-                    self.log.error(f"Invalid response from harvester: {peer_host}:{peer_port}")
-                    continue
-                rpc_response[peer_full] = response.to_json_dict()
-        return rpc_response
+
+    async def get_cached_harvesters(self, connection: WSChiaConnection) -> HarvesterCacheEntry:
+        host_cache = self.harvester_cache.get(connection.peer_host)
+        if host_cache is None:
+            host_cache = {}
+            self.harvester_cache[connection.peer_host] = host_cache
+        node_cache = host_cache.get(connection.peer_node_id.hex())
+        if node_cache is None:
+            node_cache = HarvesterCacheEntry()
+            host_cache[connection.peer_node_id.hex()] = node_cache
+        return node_cache
+
+    async def get_harvesters(self) -> Dict:
+        harvesters: List = []
+        for connection in self.server.get_connections(NodeType.HARVESTER):
+            self.log.debug(f"get_harvesters host: {connection.peer_host}, node_id: {connection.peer_node_id}")
+            cache_entry = await self.get_cached_harvesters(connection)
+            if cache_entry.data is not None:
+                harvester_object: dict = dict(cache_entry.data)
+                harvester_object["connection"] = {
+                    "node_id": connection.peer_node_id.hex(),
+                    "host": connection.peer_host,
+                    "port": connection.peer_port,
+                }
+                harvesters.append(harvester_object)
+            else:
+                self.log.debug(f"get_harvesters no cache: {connection.peer_host}, node_id: {connection.peer_node_id}")
+
+        return {"harvesters": harvesters}
 
     async def _periodically_update_pool_state_task(self):
         time_slept: uint64 = uint64(0)
@@ -531,27 +651,34 @@ class Farmer:
         time_slept: uint64 = uint64(0)
         refresh_slept = 0
         while not self._shut_down:
-            if time_slept > self.constants.SUB_SLOT_TIME_TARGET:
-                now = time.time()
-                removed_keys: List[bytes32] = []
-                for key, add_time in self.cache_add_time.items():
-                    if now - float(add_time) > self.constants.SUB_SLOT_TIME_TARGET * 3:
-                        self.sps.pop(key, None)
-                        self.proofs_of_space.pop(key, None)
-                        self.quality_str_to_identifiers.pop(key, None)
-                        self.number_of_responses.pop(key, None)
-                        removed_keys.append(key)
-                for key in removed_keys:
-                    self.cache_add_time.pop(key, None)
-                time_slept = uint64(0)
-                log.debug(
-                    f"Cleared farmer cache. Num sps: {len(self.sps)} {len(self.proofs_of_space)} "
-                    f"{len(self.quality_str_to_identifiers)} {len(self.number_of_responses)}"
-                )
-            time_slept += 1
-            refresh_slept += 1
-            # Periodically refresh GUI to show the correct download/upload rate.
-            if refresh_slept >= 30:
-                self.state_changed("add_connection", {})
-                refresh_slept = 0
+            try:
+                if time_slept > self.constants.SUB_SLOT_TIME_TARGET:
+                    now = time.time()
+                    removed_keys: List[bytes32] = []
+                    for key, add_time in self.cache_add_time.items():
+                        if now - float(add_time) > self.constants.SUB_SLOT_TIME_TARGET * 3:
+                            self.sps.pop(key, None)
+                            self.proofs_of_space.pop(key, None)
+                            self.quality_str_to_identifiers.pop(key, None)
+                            self.number_of_responses.pop(key, None)
+                            removed_keys.append(key)
+                    for key in removed_keys:
+                        self.cache_add_time.pop(key, None)
+                    time_slept = uint64(0)
+                    log.debug(
+                        f"Cleared farmer cache. Num sps: {len(self.sps)} {len(self.proofs_of_space)} "
+                        f"{len(self.quality_str_to_identifiers)} {len(self.number_of_responses)}"
+                    )
+                time_slept += 1
+                refresh_slept += 1
+                # Periodically refresh GUI to show the correct download/upload rate.
+                if refresh_slept >= 30:
+                    self.state_changed("add_connection", {})
+                    refresh_slept = 0
+
+                # Handles harvester plots cache cleanup and updates
+                await self.update_cached_harvesters()
+            except Exception:
+                log.error(f"_periodically_clear_cache_and_refresh_task failed: {traceback.print_exc()}")
+
             await asyncio.sleep(1)
